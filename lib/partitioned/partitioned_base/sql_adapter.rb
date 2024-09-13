@@ -162,12 +162,24 @@ module Partitioned
       # Create a single child table.
       #
       def create_partition_table(*partition_key_values)
-        create_table(configurator.table_name(*partition_key_values), {
-                       :id => false,
-                       :options => "INHERITS (#{configurator.parent_table_name(*partition_key_values)})"
-                     }) do |t|
+        table_name = configurator.table_name(*partition_key_values)
+        parent_table_name = configurator.parent_table_name(*partition_key_values)
+        constraint = configurator.check_constraint(*partition_key_values)
+
+        if constraint
+          sql = <<-SQL
+            CREATE TABLE #{table_name} (
+              CHECK (#{constraint})
+            ) INHERITS (#{parent_table_name})
+          SQL
+        else
+          sql = <<-SQL
+            CREATE TABLE #{table_name}
+            INHERITS (#{parent_table_name})
+          SQL
         end
-        add_check_constraint(*partition_key_values)
+
+        ActiveRecord::Base.connection.execute(sql)
       end
 
       #
@@ -201,7 +213,7 @@ module Partitioned
             name = [*field].join('_')
             used_options[:name] = used_options[:unique] ? unique_index_name(name, *partition_key_values) : index_name(name, *partition_key_values)
           end
-          add_index(partition_table_name(*partition_key_values), field, used_options)
+          add_index(partition_table_name(*partition_key_values), field, **used_options)
         end
       end
 

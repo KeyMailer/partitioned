@@ -1,14 +1,14 @@
 common: &common
   adapter: postgresql
   username: postgres
-  password: postgres
-  encoding: SQL_ASCII
-  template: template0
+  password:
+  port: 5433
+  encoding: unicode
   pool: 5
   timeout: 5000
 
 local: &local
-  host: 127.0.0.1
+  host: localhost
 
 # -----------------
 # *** part ***

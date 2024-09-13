@@ -1,208 +1,119 @@
-require 'active_record'
-require 'active_record/base'
-require 'active_record/connection_adapters/abstract_adapter'
-require 'active_record/relation.rb'
-require 'active_record/persistence.rb'
-require 'active_record/relation/query_methods.rb'
+require "active_record/insert_all"
 
 #
 # Patching {ActiveRecord} to allow specifying the table name as a function of
 # attributes.
 #
 module ActiveRecord
-  #
-  # Patches for Persistence to allow certain partitioning (that related to the primary key) to work.
-  #
   module Persistence
-    # This method is patched to provide a relation referencing the partition instead
-    # of the parent table.
-    def relation_for_destroy
-      pk         = self.class.primary_key
-      column     = self.class.columns_hash[pk]
-      substitute = self.class.connection.substitute_at(column, 0)
+    module ClassMethods
+      def _insert_record(values, curr_arel_table = nil) # :nodoc:
+        primary_key = self.primary_key
+        primary_key_value = nil
 
-      # ****** BEGIN PARTITIONED PATCH ******
-      if self.class.respond_to?(:dynamic_arel_table)
-        using_arel_table = dynamic_arel_table()
-        relation = ActiveRecord::Relation.new(self.class, using_arel_table).
-          where(using_arel_table[pk].eq(substitute))
-      else
-        # ****** END PARTITIONED PATCH ******
+        if primary_key && Hash === values
+          primary_key_value = values[primary_key]
 
-        relation = self.class.unscoped.where(self.class.arel_table[pk].eq(substitute))
+          if !primary_key_value && prefetch_primary_key?
+            primary_key_value = next_sequence_value
+            values[primary_key] = primary_key_value
+          end
+        end
 
-        # ****** BEGIN PARTITIONED PATCH ******
+        tmp_arel_table = curr_arel_table || arel_table
+
+        if values.empty?
+          im = connection.empty_insert_statement_value(primary_key)
+          im.into tmp_arel_table
+        else
+          im = _substitute_values(values,tmp_arel_table)
+        end
+      
+        # Create an insert statement with Arel
+        insert_manager = Arel::InsertManager.new
+        insert_manager.into(tmp_arel_table)
+        
+        insert_data = []
+        im.each do |attr, bind|
+          insert_data << [attr, bind]
+        end
+      
+        sql, binds = insert_manager.insert(insert_data).to_sql, insert_data.map(&:last)
+        
+        connection.insert(sql, "#{self} Create", primary_key || false, primary_key_value, nil, binds)
       end
-      # ****** END PARTITIONED PATCH ******
 
-      relation.bind_values = [[column, id]]
-      relation
+      def _update_record(values, constraints, curr_arel_table = nil) # :nodoc:
+        tmp_arel_table = curr_arel_table || arel_table
+        constraints = _substitute_values(constraints, tmp_arel_table).map { |attr, bind| attr.eq(bind) }
+
+        um = tmp_arel_table.where(
+          constraints.reduce(&:and)
+        ).compile_update(_substitute_values(values, tmp_arel_table), primary_key)
+
+        update_data = []
+        values.each do |attr, bind|
+          update_data << [attr, bind]
+        end
+
+        sql, binds = um.to_sql, update_data.map(&:last)
+
+        connection.update(sql, "#{self} Update", binds)
+      end
+
+      def _delete_record(constraints, curr_arel_table = nil) # :nodoc:
+        tmp_arel_table = curr_arel_table || arel_table
+        constraints = _substitute_values(constraints, tmp_arel_table).map { |attr, bind| attr.eq(bind) }
+
+        dm = Arel::DeleteManager.new
+        dm.from(tmp_arel_table)
+        dm.wheres = constraints
+
+        sql = dm.to_sql
+        connection.delete(sql, "#{self} Destroy")
+      end
+
+      def _substitute_values(values, tmp_arel_table = nil)
+        curr_arel_table = tmp_arel_table || arel_table
+        values.map do |name, value|
+          attr = curr_arel_table[name]
+          bind = predicate_builder.build_bind_attribute(attr.name, value)
+          [attr, bind.value_before_type_cast]
+        end
+      end
+    end # module ClassMethods
+
+    def _update_row(attribute_names, attempted_action = "update")
+      self.class._update_record(
+        attributes_with_values(attribute_names),
+        {@primary_key => id_in_database},
+        self.respond_to?(:dynamic_arel_table) ? self.dynamic_arel_table : nil
+      )
     end
 
-    # This method is patched to prefetch the primary key (if necessary) and to ensure
-    # that the partitioning attributes are always included (AR will exclude them
-    # if the db column's default value is the same as the new record's value).
-    def _create_record(attribute_names = @attributes.keys)
-      # ****** BEGIN PARTITIONED PATCH ******
-      if self.id.nil? && self.class.respond_to?(:prefetch_primary_key?) && self.class.prefetch_primary_key?
-        self.id = self.class.connection.next_sequence_value(self.class.sequence_name)
-        attribute_names |= ["id"]
-      end
-
-      if self.class.respond_to?(:partition_keys)
-        attribute_names |= self.class.partition_keys.map(&:to_s)
-      end
-      # ****** END PARTITIONED PATCH ******
-
-      attributes_values = arel_attributes_with_values_for_create(attribute_names)
-
-      new_id = self.class.unscoped.insert attributes_values
-      self.id ||= new_id if self.class.primary_key
-
-      @new_record = false
-      id
+    def _create_record(attribute_names = self.attribute_names)
+        attribute_names = attributes_for_create(attribute_names)
+  
+        new_id = self.class._insert_record(
+          attributes_with_values(attribute_names),
+          self.respond_to?(:dynamic_arel_table) ? self.dynamic_arel_table : nil
+        )
+  
+        self.id ||= new_id if @primary_key
+  
+        @new_record = false
+        @previously_new_record = true
+  
+        yield(self) if block_given?
+  
+        id
     end
 
-    # Updates the associated record with values matching those of the instance attributes.
-    # Returns the number of affected rows.
-    def _update_record(attribute_names = @attributes.keys)
-      # ****** BEGIN PARTITIONED PATCH ******
-      # NOTE(hofer): This patch ensures the columns the table is
-      # partitioned on are passed along to the update code so that the
-      # update statement runs against a child partition, not the
-      # parent table, to help with performance.
-      if self.class.respond_to?(:partition_keys)
-        attribute_names.concat self.class.partition_keys.map(&:to_s)
-        attribute_names.uniq!
-      end
-      # ****** END PARTITIONED PATCH ******
-      attributes_values = arel_attributes_with_values_for_update(attribute_names)
-      if attributes_values.empty?
-        0
-      else
-        self.class.unscoped._update_record attributes_values, id, id_was
-      end
+    def _delete_row
+      self.class._delete_record(
+        {@primary_key => id_in_database},
+        self.respond_to?(:dynamic_arel_table) ? self.dynamic_arel_table : nil
+      )
     end
-
   end # module Persistence
-
-  module QueryMethods
-
-    # This method is patched to change the default behavior of select
-    # to use the Relation's Arel::Table
-    def build_select(arel)
-      if !select_values.empty?
-        expanded_select = select_values.map do |field|
-          columns_hash.key?(field.to_s) ? arel_table[field] : field
-        end
-        arel.project(*expanded_select)
-      else
-        # ****** BEGIN PARTITIONED PATCH ******
-        # Original line:
-        # arel.project(@klass.arel_table[Arel.star])
-        arel.project(table[Arel.star])
-        # ****** END PARTITIONED PATCH ******
-      end
-    end
-
-  end # module QueryMethods
-
-  class Relation
-
-    # This method is patched to use a table name that is derived from
-    # the attribute values.
-    def insert(values)
-      primary_key_value = nil
-
-      if primary_key && Hash === values
-        primary_key_value = values[values.keys.find { |k|
-                                     k.name == primary_key
-                                   }]
-
-        if !primary_key_value && connection.prefetch_primary_key?(klass.table_name)
-          primary_key_value = connection.next_sequence_value(klass.sequence_name)
-          values[klass.arel_table[klass.primary_key]] = primary_key_value
-        end
-      end
-
-      im = arel.create_insert
-
-      # ****** BEGIN PARTITIONED PATCH ******
-      actual_arel_table = @klass.dynamic_arel_table(Hash[*values.map{|k,v| [k.name,v]}.flatten]) if @klass.respond_to?(:dynamic_arel_table)
-      actual_arel_table = @table unless actual_arel_table
-      # Original line:
-      # im.into @table
-      im.into actual_arel_table
-      # ****** END PARTITIONED PATCH ******
-
-      conn = @klass.connection
-
-      substitutes = values.sort_by { |arel_attr,_| arel_attr.name }
-      binds       = substitutes.map do |arel_attr, value|
-        [@klass.columns_hash[arel_attr.name], value]
-      end
-
-      substitutes.each_with_index do |tuple, i|
-        tuple[1] = conn.substitute_at(binds[i][0], i)
-      end
-
-      if values.empty? # empty insert
-        im.values = Arel.sql(connection.empty_insert_statement_value)
-      else
-        im.insert substitutes
-      end
-
-      conn.insert(
-                  im,
-                  'SQL',
-                  primary_key,
-                  primary_key_value,
-                  nil,
-                  binds)
-    end
-
-    # NOTE(hofer): This monkeypatch intended for activerecord 4.1.  Based on this code:
-    # https://github.com/rails/rails/blob/4-1-stable/activerecord/lib/active_record/relation.rb#L73-L88
-    # TODO(hofer): Update this for rails 4.2, looks like the monkeypatched method changes a bit.
-    def _update_record(values, id, id_was) # :nodoc:
-      substitutes, binds = substitute_values values
-
-      scope = @klass.unscoped
-
-      if @klass.finder_needs_type_condition?
-        scope.unscope!(where: @klass.inheritance_column)
-      end
-
-      # ****** BEGIN PARTITIONED PATCH ******
-      if @klass.respond_to?(:dynamic_arel_table)
-        using_arel_table = @klass.dynamic_arel_table(Hash[*values.map { |k,v| [k.name,v] }.flatten])
-        um = scope.where(using_arel_table[@klass.primary_key].eq(id_was || id)).arel.compile_update(substitutes, @klass.primary_key)
-
-        # NOTE(hofer): The um variable got set up using
-        # klass.arel_table as its arel value.  So arel_table.name is
-        # what gets used to construct the update statement.  Here we
-        # set it to the specific partition name for this record so
-        # that the update gets run just on that partition, not on the
-        # parent one (which can cause performance issues).
-        begin
-          @klass.arel_table.name = using_arel_table.name
-          @klass.connection.update(
-                                   um,
-                                   'SQL',
-                                   binds)
-        ensure
-          @klass.arel_table.name = @klass.table_name
-        end
-      else
-        # Original lines:
-        um = scope.where(@klass.arel_table[@klass.primary_key].eq(id_was || id)).arel.compile_update(substitutes, @klass.primary_key)
-
-        @klass.connection.update(
-                                 um,
-                                 'SQL',
-                                 binds)
-      end
-      # ****** END PARTITIONED PATCH ******
-    end
-  end # class Relation
 end # module ActiveRecord
