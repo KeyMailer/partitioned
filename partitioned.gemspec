@@ -19,7 +19,7 @@ Gem::Specification.new do |s|
 
   s.add_dependency 'pg'
   s.add_dependency 'activerecord'
-  s.add_development_dependency 'rails', '~> 7.0.8'
+  s.add_development_dependency 'rails', '~> 7.2.0'
   s.add_development_dependency 'rspec-rails'
   s.add_development_dependency 'debug'
 end

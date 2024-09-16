@@ -99,16 +99,5 @@ module ActiveRecord::ConnectionAdapters
       execute("DROP SCHEMA #{name}#{' cascade' if options[:cascade]}")
     end
 
-    #
-    # Add foreign key constraint to table.
-    #
-    # @param [String] referencing_table_name the name of the table containing the foreign key
-    # @param [String] referencing_field_name the name of foreign key column
-    # @param [String] referenced_table_name the name of the table referenced by the foreign key
-    # @param [String] referenced_field_name (:id) the name of the column referenced by the foreign key
-    # @return [optional] undefined
-    def add_foreign_key(referencing_table_name, referencing_field_name, referenced_table_name, referenced_field_name = :id)
-      execute("ALTER TABLE #{referencing_table_name} add foreign key (#{referencing_field_name}) references #{referenced_table_name}(#{referenced_field_name})")
-    end
   end
 end

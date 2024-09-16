@@ -1,7 +1,6 @@
 #
 # :include: ../../README
 #
-require "bulk_data_methods"
 
 module Partitioned
   #
@@ -20,8 +19,6 @@ module Partitioned
   # Uses a domain specific language to configure, see Partitioned::PartitionedBase::Configurator
   # for more information.
   #
-  # Extends BulkMethodsMixin to provide create_many and update_many.
-  #
   # Uses PartitionManager to manage creation of child tables.
   #
   # Monkey patches some ActiveRecord routines to call back to this class when INSERT and UPDATE
@@ -29,7 +26,6 @@ module Partitioned
   #
   class PartitionedBase < ActiveRecord::Base
     include ActiveRecordOverrides
-    extend ::BulkMethodsMixin
 
     self.abstract_class = true
 
@@ -52,7 +48,7 @@ module Partitioned
     # @return [Array<Object>] values of partition keys
     def self.partition_key_values(values)
       symbolized_values = values.symbolize_keys
-      return self.partition_keys.map{|key| symbolized_values[key.to_sym]}
+      self.partition_keys.map{|key| symbolized_values.has_key?(key) ? symbolized_values[key] : column_defaults[key.to_s]}
     end
 
     #
@@ -73,7 +69,7 @@ module Partitioned
     # @param [Object] value the partition key value
     # @return [Object] the normalized value for the key value passed in
     def self.partition_normalize_key_value(value)
-      return value
+      return value.respond_to?(:value) ? value.value : value
     end
 
     #
@@ -106,34 +102,20 @@ module Partitioned
       @sql_adapter ||= connection.partitioned_sql_adapter(self)
       return @sql_adapter
     end
-    
+
     def self.arel_table_from_key_values(partition_key_values, as = nil)
       @arel_tables ||= {}
       new_arel_table = @arel_tables[[partition_key_values, as]]
-      
+
       unless new_arel_table
-        new_arel_table = self.arel_table.dup
-        new_arel_table.table_alias = as unless as.nil?
-        new_arel_table.name = self.partition_table_name(*partition_key_values)
+        type_caster_hash = { type_caster: type_caster, as: as }
+        new_arel_table = Arel::Table.new(self.partition_table_name(*partition_key_values), **type_caster_hash)
         @arel_tables[[partition_key_values, as]] = new_arel_table
       end
 
       return new_arel_table
     end
 
-    def self.predicate_builder_from_arel_table(arel_table, as = nil)
-        @predicate_builders ||= {}
-        pb = @predicate_builders[[arel_table.name, as]]
-        
-        unless pb
-          tm = ActiveRecord::TableMetadata.new(self,arel_table)
-          pb = ActiveRecord::PredicateBuilder.new(tm)
-          @predicate_builders[[arel_table.name, as]] = pb
-        end
-        
-        return pb
-    end
-    
     #
     # In activerecord 3.0 we need to supply an Arel::Table for the key value(s) used
     # to determine the specific child table to access.
@@ -163,7 +145,7 @@ module Partitioned
     # parent table (so activerecord can generally work with it)
     #
     # Use as:
-    
+    #
     #   Foo.from_partition(KEY).first
     #
     # where KEY is the key value(s) used as the check constraint on Foo's table.
@@ -172,11 +154,11 @@ module Partitioned
     # @return [Hash] the scoping
     def self.from_partition(*partition_key_values)
       table_alias_name = partition_table_alias_name(*partition_key_values)
-      table = self.arel_table_from_key_values(partition_key_values, table_alias_name)
-      predicate_builder = predicate_builder_from_arel_table(table, table_alias_name)
-      return ActiveRecord::Relation.create(self, table: table, predicate_builder: predicate_builder)
-    end
+      arel_table = self.arel_table_from_key_values(partition_key_values, table_alias_name)
+      predicate_builder = ActiveRecord::PredicateBuilder.new ActiveRecord::TableMetadata.new(self, arel_table)
 
+      return self.const_get(:ActiveRecord_Relation).new(self, table: arel_table, predicate_builder: predicate_builder)
+    end
 
     #
     # This scope is used to target the
@@ -201,9 +183,7 @@ module Partitioned
     # @param [*Array<Object>] partition_field the field values to partition on
     # @return [Hash] the scoping
     def self.from_partition_without_alias(*partition_key_values)
-      table = self.arel_table_from_key_values(partition_key_values, nil)
-      predicate_builder = predicate_builder_from_arel_table(table, nil)
-      return ActiveRecord::Relation.create(self, table: table, predicate_builder: predicate_builder)
+      return ActiveRecord::Relation.new(self, self.arel_table_from_key_values(partition_key_values, nil))
     end
 
     #
@@ -220,7 +200,7 @@ module Partitioned
     #
     # Yields an object used to configure the ActiveRecord class for partitioning
     # using the Configurator Domain Specific Language.
-    # 
+    #
     # usage:
     #   partitioned do |partition|
     #     partition.on    :company_id

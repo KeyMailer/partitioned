@@ -32,7 +32,7 @@ module Partitioned
     # @param [Time] time_value the partitioned key value
     # @return [Time] time_value normalized
     def self.partition_normalize_key_value(time_value)
-      return time_value.to_date
+      return super.to_date
     end
 
     #

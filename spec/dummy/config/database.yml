@@ -2,7 +2,7 @@ common: &common
   adapter: postgresql
   username: postgres
   password:
-  port: 5433
+  port: 5432
   encoding: unicode
   pool: 5
   timeout: 5000

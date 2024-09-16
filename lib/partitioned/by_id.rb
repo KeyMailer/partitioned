@@ -4,7 +4,7 @@ module Partitioned
   # the value of its primary key. A specific record's child table
   # is determined by the number resulting from the integer math:
   #   ID / ById::partition_table_size * ById::partition_table_size
-  # 
+  #
   class ById < ByIntegerField
     self.abstract_class = true
 

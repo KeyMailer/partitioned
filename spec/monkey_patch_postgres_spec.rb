@@ -24,7 +24,6 @@ module ActiveRecord::ConnectionAdapters
       before do
         class Employee < ActiveRecord::Base
           include Partitioned::ActiveRecordOverrides
-          extend BulkMethodsMixin
         end
         create_tables
       end
@@ -148,7 +147,7 @@ module ActiveRecord::ConnectionAdapters
             id      serial not null primary key
           );
         SQL
-        ActiveRecord::Base.connection.add_foreign_key("employees_partitions.temp", :company_id, "companies", :id)
+        ActiveRecord::Base.connection.add_foreign_key("employees_partitions.temp", "companies", column: :company_id, primary_key: :id, name: 'temp_company_id_fkey')
         result = ActiveRecord::Base.connection.execute <<-SQL
           SELECT constraint_type FROM information_schema.table_constraints
           WHERE table_name = 'temp' AND constraint_name = 'temp_company_id_fkey';

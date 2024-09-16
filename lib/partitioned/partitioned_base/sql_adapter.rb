@@ -162,24 +162,12 @@ module Partitioned
       # Create a single child table.
       #
       def create_partition_table(*partition_key_values)
-        table_name = configurator.table_name(*partition_key_values)
-        parent_table_name = configurator.parent_table_name(*partition_key_values)
-        constraint = configurator.check_constraint(*partition_key_values)
-
-        if constraint
-          sql = <<-SQL
-            CREATE TABLE #{table_name} (
-              CHECK (#{constraint})
-            ) INHERITS (#{parent_table_name})
-          SQL
-        else
-          sql = <<-SQL
-            CREATE TABLE #{table_name}
-            INHERITS (#{parent_table_name})
-          SQL
+        create_table(configurator.table_name(*partition_key_values),
+          :id => false,
+          :options => "() INHERITS (#{configurator.parent_table_name(*partition_key_values)})"
+        ) do |t|
         end
-
-        ActiveRecord::Base.connection.execute(sql)
+        add_check_constraint(*partition_key_values)
       end
 
       #
@@ -294,9 +282,11 @@ module Partitioned
       def add_references_to_partition_table(*partition_key_values)
         configurator.foreign_keys(*partition_key_values).each do |foreign_key|
           add_foreign_key(partition_table_name(*partition_key_values),
-                          foreign_key.referencing_field,
                           foreign_key.referenced_table,
-                          foreign_key.referenced_field)
+                          column: foreign_key.referencing_field,
+                          primary_key: foreign_key.referenced_field,
+                          name: "#{partition_table_name(*partition_key_values).split('.').last.underscore}_#{foreign_key.referencing_field}_fkey",
+                          if_not_exists: true)
         end
       end
 

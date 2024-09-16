@@ -12,12 +12,12 @@ module Partitioned
     # @param [Time] time_value the time value to normalize
     # @return [Time] the value normalized
     def self.partition_normalize_key_value(time_value)
-      return time_value.at_beginning_of_day.to_date
+      return super.at_beginning_of_day.to_date
     end
 
     #
     # The size of the partition table, 1 day (24 hours)
-    # 
+    #
     # @return [Integer] the size of this partition
     def self.partition_table_size
       return 1.day

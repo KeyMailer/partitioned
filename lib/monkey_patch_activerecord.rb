@@ -7,78 +7,78 @@ require "active_record/insert_all"
 module ActiveRecord
   module Persistence
     module ClassMethods
-      def _insert_record(values, curr_arel_table = nil) # :nodoc:
+      def _insert_record(connection, values, returning) # :nodoc:
         primary_key = self.primary_key
         primary_key_value = nil
 
-        if primary_key && Hash === values
-          primary_key_value = values[primary_key]
+        if prefetch_primary_key? && primary_key
+          values[primary_key] ||= begin
+                                    primary_key_value = next_sequence_value
+                                    _default_attributes[primary_key].with_cast_value(primary_key_value)
+                                  end
+        end
 
-          if !primary_key_value && prefetch_primary_key?
-            primary_key_value = next_sequence_value
-            values[primary_key] = primary_key_value
+        curr_arel_table = self.respond_to?(:dynamic_arel_table) ? self.dynamic_arel_table(values) : nil
+        im = Arel::InsertManager.new(curr_arel_table || arel_table)
+
+        with_connection do |c|
+          if values.empty?
+            im.insert(connection.empty_insert_statement_value(primary_key))
+          else
+            im.insert(values.transform_keys { |name| arel_table[name] })
           end
-        end
 
-        tmp_arel_table = curr_arel_table || arel_table
-
-        if values.empty?
-          im = connection.empty_insert_statement_value(primary_key)
-          im.into tmp_arel_table
-        else
-          im = _substitute_values(values,tmp_arel_table)
+          connection.insert(
+            im, "#{self} Create", primary_key || false, primary_key_value,
+            returning: returning
+          )
         end
-      
-        # Create an insert statement with Arel
-        insert_manager = Arel::InsertManager.new
-        insert_manager.into(tmp_arel_table)
-        
-        insert_data = []
-        im.each do |attr, bind|
-          insert_data << [attr, bind]
-        end
-      
-        sql, binds = insert_manager.insert(insert_data).to_sql, insert_data.map(&:last)
-        
-        connection.insert(sql, "#{self} Create", primary_key || false, primary_key_value, nil, binds)
       end
 
       def _update_record(values, constraints, curr_arel_table = nil) # :nodoc:
         tmp_arel_table = curr_arel_table || arel_table
-        constraints = _substitute_values(constraints, tmp_arel_table).map { |attr, bind| attr.eq(bind) }
+        constraints = _substitute_values(constraints, tmp_arel_table)
 
-        um = tmp_arel_table.where(
-          constraints.reduce(&:and)
-        ).compile_update(_substitute_values(values, tmp_arel_table), primary_key)
+        default_constraint = build_default_constraint
+        constraints << default_constraint if default_constraint
 
-        update_data = []
-        values.each do |attr, bind|
-          update_data << [attr, bind]
+        if current_scope = self.global_current_scope
+          constraints << current_scope.where_clause.ast
         end
 
-        sql, binds = um.to_sql, update_data.map(&:last)
+        um = Arel::UpdateManager.new(tmp_arel_table)
+        um.set(values.transform_keys { |name| tmp_arel_table[name] })
+        um.wheres = constraints
 
-        connection.update(sql, "#{self} Update", binds)
+        with_connection do |c|
+          c.update(um, "#{self} Update")
+        end
       end
 
       def _delete_record(constraints, curr_arel_table = nil) # :nodoc:
         tmp_arel_table = curr_arel_table || arel_table
-        constraints = _substitute_values(constraints, tmp_arel_table).map { |attr, bind| attr.eq(bind) }
+        constraints = _substitute_values(constraints, tmp_arel_table)
 
-        dm = Arel::DeleteManager.new
-        dm.from(tmp_arel_table)
+        # constraints = constraints.map { |name, value| predicate_builder[name, value] }
+
+        default_constraint = build_default_constraint
+        constraints << default_constraint if default_constraint
+
+        if current_scope = self.global_current_scope
+          constraints << current_scope.where_clause.ast
+        end
+
+        dm = Arel::DeleteManager.new(tmp_arel_table)
         dm.wheres = constraints
 
-        sql = dm.to_sql
-        connection.delete(sql, "#{self} Destroy")
+        with_connection do |c|
+          c.delete(dm, "#{self} Destroy")
+        end
       end
 
-      def _substitute_values(values, tmp_arel_table = nil)
-        curr_arel_table = tmp_arel_table || arel_table
+      def _substitute_values(values, curr_arel_table)
         values.map do |name, value|
-          attr = curr_arel_table[name]
-          bind = predicate_builder.build_bind_attribute(attr.name, value)
-          [attr, bind.value_before_type_cast]
+          predicate_builder.build(curr_arel_table[name], value, nil)
         end
       end
     end # module ClassMethods
@@ -86,32 +86,39 @@ module ActiveRecord
     def _update_row(attribute_names, attempted_action = "update")
       self.class._update_record(
         attributes_with_values(attribute_names),
-        {@primary_key => id_in_database},
+        _query_constraints_hash,
         self.respond_to?(:dynamic_arel_table) ? self.dynamic_arel_table : nil
       )
     end
 
     def _create_record(attribute_names = self.attribute_names)
-        attribute_names = attributes_for_create(attribute_names)
-  
-        new_id = self.class._insert_record(
+      attribute_names = attributes_for_create(attribute_names)
+
+      self.class.with_connection do |connection|
+        returning_columns = self.class._returning_columns_for_insert(connection)
+
+        returning_values = self.class._insert_record(
+          connection,
           attributes_with_values(attribute_names),
-          self.respond_to?(:dynamic_arel_table) ? self.dynamic_arel_table : nil
+          returning_columns
         )
-  
-        self.id ||= new_id if @primary_key
-  
-        @new_record = false
-        @previously_new_record = true
-  
-        yield(self) if block_given?
-  
-        id
+
+        returning_columns.zip(returning_values).each do |column, value|
+          _write_attribute(column, value) if !_read_attribute(column)
+        end if returning_values
+      end
+
+      @new_record = false
+      @previously_new_record = true
+
+      yield(self) if block_given?
+
+      id
     end
 
     def _delete_row
       self.class._delete_record(
-        {@primary_key => id_in_database},
+        _query_constraints_hash,
         self.respond_to?(:dynamic_arel_table) ? self.dynamic_arel_table : nil
       )
     end
